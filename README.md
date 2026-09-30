@@ -4,12 +4,13 @@
 
 ## 架构与隐私边界
 
-- 发证方离线生成 16 份演示凭证：每份含非零 `secret`、整数成绩 `score`（0–100）与深度 4 的二叉 Merkle 成员路径；叶子为 `Poseidon(secret, score)`。
-- 服务端配置仅有受信根、树深度与两个活动门槛（`data/policy.json`），**不持有任何 secret 或成绩**。
-- 浏览器导入凭证后在本地用 snarkjs 生成真实 Groth16 证明。上传内容只有证明与 4 个公开信号：`root, threshold, eventId, nullifier`，其中 `nullifier = Poseidon(secret, eventId)`。`secret`、成绩、路径不离开本机，也不写入服务日志。
+- 发证方离线生成 16 份演示凭证：每份含非零 `secret`、整数成绩 `score`（0–100）；叶子为 `Poseidon(secret, score)`。本地发证同时输出完整公开名单 `data/roster.json`，包含 16 个叶子承诺、版本号、深度 4 当前根与已撤销索引。
+- 服务端配置只有活动门槛（`data/policy.json`）、版本化公开名单（`data/roster.json`）与核销记录（`data/redemptions.json`），**不持有任何 secret 或成绩**。
+- 浏览器导入凭证后下载当前名单，在本机用 `secret + score` 定位自己的叶子承诺并重建 Merkle 路径，再用 snarkjs 生成真实 Groth16 证明。上传内容只有证明与 4 个公开信号：`nullifier, root, threshold, eventId`。持证人的叶子位置、`secret`、成绩、路径都不发送给服务端。
 - 电路（`circuits/qualification.circom`）强制约束：成绩/门槛 ∈ [0,100]、路径位为二进制、Merkle 成员关系成立、`score >= threshold`、secret 非零，且 nullifier 绑定 secret 与活动。前端判断无法替代或绕过约束。
-- 服务端按受信政策复核：公开信号中的根必须等于配置根，门槛必须等于该活动配置门槛，eventId 必须匹配；拒绝自选根或降低门槛。
-- 核销以 `(eventId, nullifier)` 为原子唯一键：同活动并发重复提交仅一次成功；证明失败不写入、不消耗资格；记录持久化到 `data/redemptions.json`，重启保留；不同活动相互独立。
+- 机构页面可按叶子索引批量撤销：请求必须带 `expectedVersion`；任一索引非法、重复、越界、已撤销或版本不匹配，整批拒绝。成功时对应位置置零、深度 4 根重算、版本仅递增一次，名单和撤销状态持久化。
+- 服务端只接受当前名单根；撤销与核销由同一个持久化串行队列定序，证明验证期间名单变化不会让过期根完成最终核销。
+- 核销以 `(eventId, canonicalNullifier)` 为原子唯一键，公开 nullifier 会先做十进制规范化，前导零不能造成重复核销；证明失败不写入、不消耗资格；记录持久化到 `data/redemptions.json`，名单更新或重启均不会清空；不同活动相互独立。
 
 ## 两个演示活动
 
@@ -48,12 +49,31 @@ npm run dev:server
 npm run dev
 ```
 
-打开 Vite 输出的地址：导入 `credentials/credential-00.json`，选择活动，点击“本地生成 Groth16 证明”，再提交核验；然后尝试 `credential-06.json` 或切换活动观察拒绝/独立核销行为。重新导入或切换活动后旧证明立即失效。
+打开 Vite 输出的地址：导入 `credentials/credential-00.json`，点击“下载/刷新完整名单”，页面会在本机定位承诺并显示有效/撤销状态；选择活动后点击“本地生成 Groth16 证明”，再提交核验。机构可在“批量撤销”中输入叶子索引和预期版本。重新导入凭证、切换活动或刷新名单后旧证明立即失效，晚到的异步证明结果不会恢复旧证明。
+
+## 撤销 API 与 curl 演示
+
+```bash
+# 查看版本、当前根和 16 个公开叶子承诺
+curl -s http://127.0.0.1:3001/api/roster | jq '.version, .root, .leaves | length'
+
+# 按叶子索引批量撤销；expectedVersion 必须等于当前版本
+curl -s -X POST http://127.0.0.1:3001/api/admin/revoke \
+  -H 'Content-Type: application/json' \
+  -d '{"expectedVersion":0,"indices":[0]}' | jq
+
+# 版本冲突或非法请求整批拒绝（409/400），名单不变
+curl -s -X POST http://127.0.0.1:3001/api/admin/revoke \
+  -H 'Content-Type: application/json' \
+  -d '{"expectedVersion":0,"indices":[1]}' | jq
+```
+
+撤销后未重新领证的持证人无需修改凭证：刷新名单后浏览器用同一份 `secret/score` 定位承诺。未撤销叶会用新路径和新根生成证明；已撤销叶在名单中位于固定位置但值为 0，页面明确提示已撤销并禁止出证。旧证明继续提交会因 `merkle root mismatch` 被拒绝。
 
 ## curl 演示真实证明
 
 ```bash
-# 达标证明（credential 0, 成绩 95, 活动 1001 门槛 60）
+# 达标证明（脚本读取当前 roster 并在本地重建路径）
 npx tsx scripts/demoProof.ts 0 1001 /tmp/proof-ok.json
 curl -s -X POST http://127.0.0.1:3001/api/redeem \
   -H 'Content-Type: application/json' --data @/tmp/proof-ok.json | jq
@@ -77,8 +97,8 @@ curl -s -X POST http://127.0.0.1:3001/api/redeem \
 
 - `circuits/qualification.circom` — 成绩门槛 + Merkle 成员 + nullifier 电路
 - `scripts/buildZk.ts` — 编译、Groth16 setup、导出验证密钥、发布浏览器产物
-- `scripts/generateCredentials.ts` — 16 份凭证 + 受信政策
+- `scripts/generateCredentials.ts` — 16 份凭证、公开名单与受信政策
 - `scripts/demoProof.ts` — 命令行生成真实证明
-- `server/` — Express 核验与持久化原子核销
+- `server/` — Express 当前根核验、版本化名单、原子撤销与持久化核销
 - `src/` — React 页面与浏览器内证明生成
 - `test/` — Vitest 电路/核销/服务端测试

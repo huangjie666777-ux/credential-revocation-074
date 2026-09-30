@@ -1,11 +1,13 @@
 import express from "express";
+import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFileSync } from "node:fs";
 import * as snarkjs from "snarkjs";
 import { loadPolicy } from "./policy.js";
-import { RedemptionStore } from "./store.js";
-import type { ProofPayload, VerifyResult } from "../shared/types.js";
+import { ConflictError, DataStore, ValidationError } from "./dataStore.js";
+import { canonicalDecimal } from "./store.js";
+import { poseidon } from "../shared/poseidon.js";
+import type { VerifyResult } from "../shared/types.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const vkey = JSON.parse(
@@ -13,7 +15,10 @@ const vkey = JSON.parse(
 ) as unknown;
 
 const policy = loadPolicy();
-const store = new RedemptionStore();
+const dataDir = process.env.DEMO_DATA_DIR
+  ? resolve(process.env.DEMO_DATA_DIR)
+  : undefined;
+const dataStore = new DataStore(await poseidon(), dataDir);
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -22,51 +27,79 @@ app.get("/api/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-// Public configuration: trusted root and server-side event thresholds.
-app.get("/api/policy", (_req, res) => {
-  res.json({
-    merkleRoot: policy.merkleRoot,
-    treeDepth: policy.treeDepth,
-    events: policy.events,
-  });
+app.get("/api/policy", (_req, res, next) => {
+  dataStore
+    .getRoster()
+    .then((roster) => {
+      res.json({
+        merkleRoot: roster.root,
+        rosterVersion: roster.version,
+        treeDepth: policy.treeDepth,
+        events: policy.events,
+      });
+    })
+    .catch(next);
+});
+
+app.get("/api/roster", (_req, res, next) => {
+  dataStore.getRoster().then((roster) => res.json(roster)).catch(next);
+});
+
+app.post("/api/admin/revoke", (req, res, next) => {
+  const body = req.body as { expectedVersion?: unknown; indices?: unknown };
+  dataStore
+    .revoke(body?.expectedVersion, body?.indices)
+    .then((roster) => res.json({ revoked: true, roster }))
+    .catch((error: Error) => {
+      if (error instanceof ConflictError) {
+        res.status(409).json({ revoked: false, reason: error.message });
+      } else if (error instanceof ValidationError) {
+        res.status(400).json({ revoked: false, reason: error.message });
+      } else {
+        next(error);
+      }
+    });
 });
 
 app.post("/api/redeem", async (req, res) => {
-  const body = req.body as Partial<ProofPayload>;
-  const fail = (status: number, reason: string): void => {
-    // Never log secrets: the body contains no secret/score/path, and the
-    // rejection log only records the reason.
+  const body = req.body as {
+    eventId?: unknown;
+    proof?: unknown;
+    publicSignals?: unknown;
+  };
+  const fail = (status: number, reason: string, rosterVersion?: number): void => {
     console.log("redeem rejected:", reason);
-    res.status(status).json({ verified: false, redeemed: false, reason } satisfies VerifyResult);
+    res.status(status).json({
+      verified: false,
+      redeemed: false,
+      reason,
+      ...(rosterVersion === undefined ? {} : { rosterVersion }),
+    } satisfies VerifyResult);
   };
 
-  const event = policy.events.find((e) => e.eventId === body?.eventId);
-  if (!event) {
-    fail(400, "unknown event");
-    return;
-  }
   if (!body || typeof body.proof !== "object" || !Array.isArray(body.publicSignals)) {
     fail(400, "malformed payload");
     return;
   }
-
-  // snarkjs public signal order: circuit outputs first, then public inputs
-  // in declaration order -> [nullifier, root, threshold, eventId].
-  const [nullifier, root, threshold, eventId] = body.publicSignals as string[];
-  if (
-    root === undefined ||
-    threshold === undefined ||
-    eventId === undefined ||
-    nullifier === undefined
-  ) {
-    fail(400, "missing public signals");
+  const event = policy.events.find((candidate) => candidate.eventId === body.eventId);
+  if (!event) {
+    fail(400, "unknown event");
     return;
   }
 
-  // Enforce server policy: the client cannot choose its own root or lower the
-  // threshold, and the proof must bind to this event id.
-  if (BigInt(root) !== BigInt(policy.merkleRoot)) {
-    fail(403, "merkle root mismatch");
+  const signals = body.publicSignals as unknown[];
+  if (signals.length !== 4 || signals.some((signal) => typeof signal !== "string")) {
+    fail(400, "malformed public signals");
+    return;
+  }
+  let nullifier: string;
+  let root: string;
+  let threshold: string;
+  let eventId: string;
+  try {
+    [nullifier, root, threshold, eventId] = (signals as string[]).map(canonicalDecimal);
+  } catch {
+    fail(400, "public signals must be non-negative decimal integers");
     return;
   }
   if (Number(threshold) !== event.threshold) {
@@ -78,45 +111,43 @@ app.post("/api/redeem", async (req, res) => {
     return;
   }
 
-  let valid = false;
   try {
-    valid = await snarkjs.groth16.verify(
-      vkey,
-      body.publicSignals,
-      body.proof as never,
+    const result = await dataStore.redeem(event.eventId, root, nullifier, () =>
+      snarkjs.groth16.verify(
+        vkey,
+        [nullifier, root, threshold, eventId],
+        body.proof as never,
+      ),
     );
-  } catch (error) {
-    fail(400, `proof verification error: ${(error as Error).message}`);
-    return;
-  }
-  if (!valid) {
-    // Failed verification does not consume the qualification.
-    fail(403, "invalid proof");
-    return;
-  }
-
-  const redeemed = await store.claim(event.eventId, nullifier);
-  if (!redeemed) {
-    res.status(409).json({
+    if (!result.redeemed) {
+      const duplicate = result.reason === "already redeemed for this event";
+      res.status(duplicate ? 409 : 403).json({
+        verified: duplicate,
+        redeemed: false,
+        eventId: event.eventId,
+        nullifier,
+        rosterVersion: result.rosterVersion,
+        reason: result.reason,
+      } satisfies VerifyResult);
+      return;
+    }
+    console.log("redeem accepted:", { eventId: event.eventId, nullifier });
+    res.json({
       verified: true,
-      redeemed: false,
+      redeemed: true,
       eventId: event.eventId,
       nullifier,
-      reason: "already redeemed for this event",
+      rosterVersion: result.rosterVersion,
     } satisfies VerifyResult);
-    return;
+  } catch (error) {
+    fail(400, `proof verification error: ${(error as Error).message}`);
   }
-  console.log("redeem accepted:", { eventId: event.eventId, nullifier });
-  res.json({
-    verified: true,
-    redeemed: true,
-    eventId: event.eventId,
-    nullifier,
-  } satisfies VerifyResult);
 });
 
 const port = Number(process.env.PORT || 3001);
 app.listen(port, "127.0.0.1", () => {
   console.log(`verification server listening on http://127.0.0.1:${port}`);
-  console.log("trusted root:", policy.merkleRoot);
+  void dataStore.getRoster().then((roster) => {
+    console.log("current roster:", { version: roster.version, root: roster.root });
+  });
 });

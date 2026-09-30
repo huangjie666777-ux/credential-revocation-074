@@ -3,8 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const dataDir = resolve(here, "..", "data");
-const dbPath = resolve(dataDir, "redemptions.json");
+const defaultDataDir = resolve(here, "..", "data");
 
 interface RedemptionRecord {
   eventId: number;
@@ -12,27 +11,41 @@ interface RedemptionRecord {
   at: string;
 }
 
-function load(): RedemptionRecord[] {
+function load(path: string): RedemptionRecord[] {
   try {
-    return JSON.parse(readFileSync(dbPath, "utf8")) as RedemptionRecord[];
+    return JSON.parse(readFileSync(path, "utf8")) as RedemptionRecord[];
   } catch {
     return [];
   }
 }
 
+export function canonicalDecimal(value: string): string {
+  if (!/^\d+$/.test(value)) {
+    throw new Error("expected a non-negative decimal integer");
+  }
+  return BigInt(value).toString();
+}
+
 export class RedemptionStore {
   private records: RedemptionRecord[];
   private chain: Promise<void> = Promise.resolve();
+  private readonly dataDir: string;
+  private readonly dbPath: string;
 
-  constructor() {
+  constructor(dataDir = defaultDataDir) {
+    this.dataDir = dataDir;
+    this.dbPath = resolve(this.dataDir, "redemptions.json");
     if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-    this.records = load();
+    this.records = load(this.dbPath).map((record) => ({
+      ...record,
+      nullifier: canonicalDecimal(record.nullifier),
+    }));
   }
 
   private persist(): void {
-    const tmp = `${dbPath}.tmp`;
+    const tmp = `${this.dbPath}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.records, null, 2) + "\n");
-    writeFileSync(dbPath, JSON.stringify(this.records, null, 2) + "\n");
+    writeFileSync(this.dbPath, JSON.stringify(this.records, null, 2) + "\n");
   }
 
   has(eventId: number, nullifier: string): boolean {
@@ -45,9 +58,14 @@ export class RedemptionStore {
   // call inserts; others see the record and return false. The record is
   // persisted before reporting success, so it survives restarts.
   claim(eventId: number, nullifier: string): Promise<boolean> {
+    const canonicalNullifier = canonicalDecimal(nullifier);
     const run = this.chain.then(() => {
-      if (this.has(eventId, nullifier)) return false;
-      this.records.push({ eventId, nullifier, at: new Date().toISOString() });
+      if (this.has(eventId, canonicalNullifier)) return false;
+      this.records.push({
+        eventId,
+        nullifier: canonicalNullifier,
+        at: new Date().toISOString(),
+      });
       this.persist();
       return true;
     });

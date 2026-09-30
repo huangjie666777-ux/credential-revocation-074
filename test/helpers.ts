@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import * as snarkjs from "snarkjs";
-import type { Credential, ProofPayload } from "../shared/types.js";
+import { merklePath } from "../shared/tree.js";
+import { poseidon } from "../shared/poseidon.js";
+import type { Credential, ProofPayload, Roster } from "../shared/types.js";
 
 const root = resolve(__dirname, "..");
 
@@ -20,6 +22,18 @@ export function loadPolicy(): {
 } {
   return JSON.parse(
     readFileSync(resolve(root, "data", "policy.json"), "utf8"),
+  );
+}
+
+export function loadRoster(): Roster {
+  const dataDir = process.env.TEST_ROSTER_DIR;
+  if (dataDir) {
+    return JSON.parse(
+      readFileSync(resolve(dataDir, "roster.json"), "utf8"),
+    );
+  }
+  return JSON.parse(
+    readFileSync(resolve(root, "data", "roster.json"), "utf8"),
   );
 }
 
@@ -46,14 +60,25 @@ export async function prove(
   const policy = loadPolicy();
   const event = policy.events.find((e) => e.eventId === eventId)!;
   const credential = loadCredential(index);
+  const roster = loadRoster();
+  const hash = await poseidon();
+  const leaves = roster.leaves.map((leaf) => BigInt(leaf));
+  const leaf = hash([
+    BigInt(overrides.secret ?? credential.secret),
+    BigInt(overrides.score ?? credential.score),
+  ]);
+  const leafIndex = leaves.findIndex((candidate) => candidate === leaf);
+  const path = leafIndex >= 0
+    ? merklePath(leafIndex, leaves, hash, roster.treeDepth)
+    : { pathElements: credential.pathElements.map(BigInt), pathIndices: credential.pathIndices };
   const { wasm, zkey } = paths();
   const { proof, publicSignals } = await snarkjs.groth16.fullProve(
     {
       secret: overrides.secret ?? credential.secret,
       score: overrides.score ?? credential.score,
-      pathElements: credential.pathElements,
-      pathIndices: credential.pathIndices,
-      root: overrides.root ?? policy.merkleRoot,
+      pathElements: path.pathElements.map(String),
+      pathIndices: path.pathIndices,
+      root: overrides.root ?? roster.root,
       threshold: overrides.threshold ?? event.threshold,
       eventId: overrides.tamperedEvent ?? event.eventId,
     },

@@ -5,7 +5,12 @@ import { createHash } from "node:crypto";
 import { poseidon } from "../shared/poseidon.js";
 import { buildMerkleTree, merklePath } from "../shared/tree.js";
 import { EVENTS } from "../shared/events.js";
-import { TREE_DEPTH, type Credential, type EventPolicy } from "../shared/types.js";
+import {
+  TREE_DEPTH,
+  type Credential,
+  type EventPolicy,
+  type Roster,
+} from "../shared/types.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
@@ -62,6 +67,17 @@ const policyConfig = {
 };
 writeFileSync(resolve(dataDir, "policy.json"), JSON.stringify(policyConfig, null, 2) + "\n");
 
+// The public roster intentionally contains only leaf commitments. It does not
+// identify which secret/score owns a leaf to anyone without that credential.
+const roster: Roster = {
+  version: 0,
+  treeDepth: TREE_DEPTH,
+  leaves: tree.leaves.map((leaf) => leaf.toString()),
+  root: tree.root.toString(),
+  revokedIndices: [],
+};
+writeFileSync(resolve(dataDir, "roster.json"), JSON.stringify(roster, null, 2) + "\n");
+
 // Demo manifest (not used by the verifier; only helps the presenter).
 const manifest = credentials.map((c) => {
   const qualification = EVENTS.map((e) => ({
@@ -77,3 +93,4 @@ writeFileSync(resolve(credDir, "manifest.json"), JSON.stringify(manifest, null, 
 console.log(`generated ${credentials.length} credentials in credentials/`);
 console.log("trusted merkle root:", tree.root.toString());
 console.log("server policy written to data/policy.json (no secrets)");
+console.log("public 16-leaf roster written to data/roster.json");

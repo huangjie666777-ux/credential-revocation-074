@@ -2,7 +2,9 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as snarkjs from "snarkjs";
-import type { Credential, ProofPayload } from "../shared/types.js";
+import { poseidon } from "../shared/poseidon.js";
+import { merklePath } from "../shared/tree.js";
+import type { Credential, ProofPayload, Roster } from "../shared/types.js";
 
 // CLI: tsx scripts/demoProof.ts <credentialIndex> <eventId> [outFile]
 // Produces a real Groth16 proof payload suitable for /api/redeem.
@@ -17,9 +19,10 @@ if (!Number.isInteger(indexArg) || !Number.isInteger(eventId)) {
   process.exit(2);
 }
 
-const policy = JSON.parse(
-  readFileSync(resolve(root, "data", "policy.json"), "utf8"),
-) as { merkleRoot: string; events: { eventId: number; threshold: number }[] };
+const policy = JSON.parse(readFileSync(resolve(root, "data", "policy.json"), "utf8")) as {
+  events: { eventId: number; threshold: number }[];
+};
+const roster = JSON.parse(readFileSync(resolve(root, "data", "roster.json"), "utf8")) as Roster;
 const event = policy.events.find((e) => e.eventId === eventId);
 if (!event) throw new Error(`unknown event ${eventId}`);
 
@@ -29,14 +32,21 @@ const credential = JSON.parse(
     "utf8",
   ),
 ) as Credential;
+const hash = await poseidon();
+const leaves = roster.leaves.map((leaf) => BigInt(leaf));
+const leaf = hash([BigInt(credential.secret), BigInt(credential.score)]);
+const leafIndex = leaves.indexOf(leaf);
+if (leafIndex < 0) throw new Error("credential is revoked or absent from current roster");
+if (leaf === 0n) throw new Error("credential commitment must be non-zero");
+const path = merklePath(leafIndex, leaves, hash, roster.treeDepth);
 
 const { proof, publicSignals } = await snarkjs.groth16.fullProve(
   {
     secret: credential.secret,
     score: credential.score,
-    pathElements: credential.pathElements,
-    pathIndices: credential.pathIndices,
-    root: policy.merkleRoot,
+    pathElements: path.pathElements.map((value) => value.toString()),
+    pathIndices: path.pathIndices,
+    root: roster.root,
     threshold: event.threshold,
     eventId: event.eventId,
   },
@@ -49,6 +59,8 @@ const json = JSON.stringify(payload);
 if (outFile) {
   writeFileSync(outFile, json);
   console.log(`proof written to ${outFile}`);
+  process.exit(0);
 } else {
   process.stdout.write(json);
+  process.exit(0);
 }

@@ -5,6 +5,14 @@ export interface MerklePath {
   pathIndices: number[];
 }
 
+export interface Roster {
+  version: number;
+  treeDepth: number;
+  leaves: string[];
+  root: string;
+  revokedIndices: number[];
+}
+
 export interface Credential {
   secret: string;
   score: number;
@@ -30,5 +38,6 @@ export interface VerifyResult {
   redeemed: boolean;
   eventId?: number;
   nullifier?: string;
+  rosterVersion?: number;
   reason?: string;
 }
