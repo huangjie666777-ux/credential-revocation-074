@@ -49,3 +49,7 @@ export function merklePath(
   }
   return { pathElements, pathIndices };
 }
+
+export function findLeafIndex(leaves: bigint[], leaf: bigint): number {
+  return leaves.findIndex((candidate) => candidate === leaf);
+}

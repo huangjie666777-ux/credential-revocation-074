@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { poseidon } from "../shared/poseidon.js";
-import { loadCredential, loadPolicy, prove, verifyProof } from "./helpers";
+import { loadCredential, loadRoster, prove, verifyProof } from "./helpers";
 
 // Scores from scripts/generateCredentials.ts:
 // idx 0 -> 95 (passes both), idx 5 -> 60 (passes 60 only),
@@ -9,9 +9,9 @@ import { loadCredential, loadPolicy, prove, verifyProof } from "./helpers";
 describe("qualification circuit (real Groth16)", () => {
   it("accepts a member above the threshold and verifies with bound signals", async () => {
     const payload = await prove(0, 1001);
-    const policy = loadPolicy();
+    const roster = loadRoster();
     expect(payload.publicSignals).toHaveLength(4);
-    expect(BigInt(payload.publicSignals[1])).toBe(BigInt(policy.merkleRoot));
+    expect(BigInt(payload.publicSignals[1])).toBe(BigInt(roster.root));
     expect(Number(payload.publicSignals[2])).toBe(60);
     expect(Number(payload.publicSignals[3])).toBe(1001);
     expect(await verifyProof(payload)).toBe(true);
@@ -51,5 +51,12 @@ describe("qualification circuit (real Groth16)", () => {
 
   it("out-of-range threshold cannot satisfy the circuit", async () => {
     await expect(prove(0, 1001, { threshold: 101 })).rejects.toBeTruthy();
+  });
+
+  it("rejects a negative threshold supplied as a wrapped field value", async () => {
+    const negativeOne = (1n << 254n).toString();
+    await expect(
+      prove(0, 1001, { threshold: Number(negativeOne) }),
+    ).rejects.toBeTruthy();
   });
 });

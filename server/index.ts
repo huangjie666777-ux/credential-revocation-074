@@ -4,40 +4,100 @@ import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import * as snarkjs from "snarkjs";
 import { loadPolicy } from "./policy.js";
-import { RedemptionStore } from "./store.js";
-import type { ProofPayload, VerifyResult } from "../shared/types.js";
+import {
+  canonicalFieldElement,
+  RedemptionStore,
+  RosterStore,
+} from "./store.js";
+import { poseidon } from "../shared/poseidon.js";
+import { TREE_DEPTH } from "../shared/types.js";
+import type {
+  ProofPayload,
+  RevokeRequest,
+  VerifyResult,
+} from "../shared/types.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const vkey = JSON.parse(
   readFileSync(resolve(here, "..", "zk", "verification_key.json"), "utf8"),
 ) as unknown;
 
+const dataDir = process.env.DATA_DIR
+  ? resolve(process.env.DATA_DIR)
+  : resolve(here, "..", "data");
 const policy = loadPolicy();
-const store = new RedemptionStore();
+const hash = await poseidon();
+const rosterStore = new RosterStore(hash, dataDir);
+await rosterStore.ready();
+const store = new RedemptionStore(dataDir);
+let operationChain: Promise<unknown> = Promise.resolve();
+
+function runSerialized<T>(operation: () => Promise<T>): Promise<T> {
+  const result = operationChain.then(operation, operation);
+  operationChain = result.then(() => undefined, () => undefined);
+  return result;
+}
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-// Public configuration: trusted root and server-side event thresholds.
 app.get("/api/policy", (_req, res) => {
+  const roster = rosterStore.current();
   res.json({
-    merkleRoot: policy.merkleRoot,
+    merkleRoot: roster.root,
     treeDepth: policy.treeDepth,
+    rosterVersion: roster.version,
     events: policy.events,
   });
+});
+
+app.get("/api/roster", (_req, res) => {
+  res.json({ ...rosterStore.current(), treeDepth: TREE_DEPTH });
+});
+
+app.post("/api/revoke", async (req, res) => {
+  const body = req.body as Partial<RevokeRequest>;
+  if (
+    !body ||
+    !Number.isInteger(body.expectedVersion) ||
+    !Array.isArray(body.indices)
+  ) {
+    res.status(400).json({ reason: "expectedVersion and indices are required" });
+    return;
+  }
+  try {
+    const indices = body.indices.slice();
+    const expectedVersion = body.expectedVersion as number;
+    const roster = await runSerialized(() =>
+      rosterStore.revoke(indices, expectedVersion, dataDir),
+    );
+    res.json({
+      version: roster.version,
+      root: roster.root,
+      leaves: roster.leaves,
+      revokedIndices: [...new Set(body.indices)],
+    });
+  } catch (error) {
+    const status = (error as { status?: number }).status ?? 500;
+    const reason = (error as Error).message;
+    console.log("revoke rejected:", reason);
+    res.status(status).json({ reason });
+  }
 });
 
 app.post("/api/redeem", async (req, res) => {
   const body = req.body as Partial<ProofPayload>;
   const fail = (status: number, reason: string): void => {
-    // Never log secrets: the body contains no secret/score/path, and the
-    // rejection log only records the reason.
     console.log("redeem rejected:", reason);
-    res.status(status).json({ verified: false, redeemed: false, reason } satisfies VerifyResult);
+    res.status(status).json({
+      verified: false,
+      redeemed: false,
+      reason,
+    } satisfies VerifyResult);
   };
 
   const event = policy.events.find((e) => e.eventId === body?.eventId);
@@ -50,62 +110,67 @@ app.post("/api/redeem", async (req, res) => {
     return;
   }
 
-  // snarkjs public signal order: circuit outputs first, then public inputs
-  // in declaration order -> [nullifier, root, threshold, eventId].
-  const [nullifier, root, threshold, eventId] = body.publicSignals as string[];
-  if (
-    root === undefined ||
-    threshold === undefined ||
-    eventId === undefined ||
-    nullifier === undefined
-  ) {
-    fail(400, "missing public signals");
-    return;
-  }
-
-  // Enforce server policy: the client cannot choose its own root or lower the
-  // threshold, and the proof must bind to this event id.
-  if (BigInt(root) !== BigInt(policy.merkleRoot)) {
-    fail(403, "merkle root mismatch");
-    return;
-  }
-  if (Number(threshold) !== event.threshold) {
-    fail(403, "threshold mismatch");
-    return;
-  }
-  if (BigInt(eventId) !== BigInt(event.eventId)) {
-    fail(403, "event id mismatch");
-    return;
-  }
-
-  let valid = false;
+  const [rawNullifier, rawRoot, rawThreshold, rawEventId] = body.publicSignals as string[];
+  let nullifier: string;
+  let root: string;
+  let threshold: string;
+  let eventId: string;
   try {
-    valid = await snarkjs.groth16.verify(
-      vkey,
-      body.publicSignals,
-      body.proof as never,
-    );
-  } catch (error) {
-    fail(400, `proof verification error: ${(error as Error).message}`);
-    return;
-  }
-  if (!valid) {
-    // Failed verification does not consume the qualification.
-    fail(403, "invalid proof");
+    nullifier = canonicalFieldElement(rawNullifier);
+    root = canonicalFieldElement(rawRoot);
+    threshold = canonicalFieldElement(rawThreshold);
+    eventId = canonicalFieldElement(rawEventId);
+  } catch {
+    fail(400, "invalid public signals");
     return;
   }
 
-  const redeemed = await store.claim(event.eventId, nullifier);
-  if (!redeemed) {
-    res.status(409).json({
-      verified: true,
-      redeemed: false,
-      eventId: event.eventId,
-      nullifier,
-      reason: "already redeemed for this event",
-    } satisfies VerifyResult);
+  try {
+    await runSerialized(async () => {
+      const currentRoster = rosterStore.current();
+      if (BigInt(root) !== BigInt(currentRoster.root)) {
+        throw Object.assign(new Error("merkle root mismatch"), { status: 403 });
+      }
+      if (BigInt(threshold) !== BigInt(event.threshold)) {
+        throw Object.assign(new Error("threshold mismatch"), { status: 403 });
+      }
+      if (BigInt(eventId) !== BigInt(event.eventId)) {
+        throw Object.assign(new Error("event id mismatch"), { status: 403 });
+      }
+
+      const valid = await snarkjs.groth16.verify(
+        vkey,
+        [nullifier, root, threshold, eventId],
+        body.proof as never,
+      );
+      if (!valid) {
+        throw Object.assign(new Error("invalid proof"), { status: 403 });
+      }
+
+      const redeemed = await store.claim(event.eventId, nullifier);
+      if (!redeemed) {
+        throw Object.assign(new Error("already redeemed for this event"), {
+          status: 409,
+          duplicate: true,
+        });
+      }
+    });
+  } catch (error) {
+    const reason = (error as Error).message;
+    if ((error as { duplicate?: boolean }).duplicate) {
+      res.status(409).json({
+        verified: true,
+        redeemed: false,
+        eventId: event.eventId,
+        nullifier,
+        reason,
+      } satisfies VerifyResult);
+    } else {
+      fail((error as { status?: number }).status ?? 400, reason);
+    }
     return;
   }
+
   console.log("redeem accepted:", { eventId: event.eventId, nullifier });
   res.json({
     verified: true,
@@ -118,5 +183,6 @@ app.post("/api/redeem", async (req, res) => {
 const port = Number(process.env.PORT || 3001);
 app.listen(port, "127.0.0.1", () => {
   console.log(`verification server listening on http://127.0.0.1:${port}`);
-  console.log("trusted root:", policy.merkleRoot);
+  console.log("trusted root:", rosterStore.current().root);
+  console.log("roster version:", rosterStore.current().version);
 });

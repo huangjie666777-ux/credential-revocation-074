@@ -5,7 +5,7 @@ import { createHash } from "node:crypto";
 import { poseidon } from "../shared/poseidon.js";
 import { buildMerkleTree, merklePath } from "../shared/tree.js";
 import { EVENTS } from "../shared/events.js";
-import { TREE_DEPTH, type Credential, type EventPolicy } from "../shared/types.js";
+import { TREE_DEPTH, type Credential, type EventPolicy, type Roster } from "../shared/types.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
@@ -36,6 +36,12 @@ if (leaves.length !== 2 ** TREE_DEPTH) {
   throw new Error(`expected ${2 ** TREE_DEPTH} leaves`);
 }
 
+const roster: Roster = {
+  version: 0,
+  leaves: leaves.map((leaf) => leaf.toString()),
+  root: tree.root.toString(),
+};
+
 const credentials: Array<Credential & { index: number }> = [];
 for (let i = 0; i < leaves.length; i++) {
   const path = merklePath(i, leaves, hash);
@@ -56,11 +62,12 @@ for (let i = 0; i < leaves.length; i++) {
 // Server-side trusted configuration: root + event policies only.
 // It contains NO credential secrets or scores.
 const policyConfig = {
-  merkleRoot: tree.root.toString(),
   treeDepth: TREE_DEPTH,
   events: EVENTS satisfies EventPolicy[],
 };
 writeFileSync(resolve(dataDir, "policy.json"), JSON.stringify(policyConfig, null, 2) + "\n");
+writeFileSync(resolve(dataDir, "roster.json"), JSON.stringify(roster, null, 2) + "\n");
+writeFileSync(resolve(credDir, "roster.json"), JSON.stringify(roster, null, 2) + "\n");
 
 // Demo manifest (not used by the verifier; only helps the presenter).
 const manifest = credentials.map((c) => {
@@ -76,4 +83,5 @@ writeFileSync(resolve(credDir, "manifest.json"), JSON.stringify(manifest, null, 
 
 console.log(`generated ${credentials.length} credentials in credentials/`);
 console.log("trusted merkle root:", tree.root.toString());
+console.log("public roster written to data/roster.json and credentials/roster.json");
 console.log("server policy written to data/policy.json (no secrets)");

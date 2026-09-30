@@ -56,6 +56,10 @@ button:disabled {
   cursor: not-allowed;
 }
 
+button.secondary {
+  background: #52607d;
+}
+
 .info {
   display: flex;
   flex-direction: column;

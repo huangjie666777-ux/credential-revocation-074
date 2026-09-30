@@ -4,12 +4,14 @@
 
 ## 架构与隐私边界
 
-- 发证方离线生成 16 份演示凭证：每份含非零 `secret`、整数成绩 `score`（0–100）与深度 4 的二叉 Merkle 成员路径；叶子为 `Poseidon(secret, score)`。
-- 服务端配置仅有受信根、树深度与两个活动门槛（`data/policy.json`），**不持有任何 secret 或成绩**。
-- 浏览器导入凭证后在本地用 snarkjs 生成真实 Groth16 证明。上传内容只有证明与 4 个公开信号：`root, threshold, eventId, nullifier`，其中 `nullifier = Poseidon(secret, eventId)`。`secret`、成绩、路径不离开本机，也不写入服务日志。
-- 电路（`circuits/qualification.circom`）强制约束：成绩/门槛 ∈ [0,100]、路径位为二进制、Merkle 成员关系成立、`score >= threshold`、secret 非零，且 nullifier 绑定 secret 与活动。前端判断无法替代或绕过约束。
-- 服务端按受信政策复核：公开信号中的根必须等于配置根，门槛必须等于该活动配置门槛，eventId 必须匹配；拒绝自选根或降低门槛。
+- 发证方离线生成 16 份演示凭证和公开名单：凭证含非零 `secret`、整数成绩 `score`（0–100）；`credentials/roster.json` 与服务端 `data/roster.json` 仅含版本、16 个叶承诺和当前根，叶子为 `Poseidon(secret, score)`。
+- 服务端配置只有公开名单、树深度与两个活动门槛（`data/policy.json` 不存秘密或成绩）。机构撤销时按叶子索引把对应承诺置为 `0`，位置不变、深度 4 根重算、版本原子递增。
+- 浏览器导入凭证后下载完整当前名单，在本机用 `secret + score` 计算承诺并定位叶索引，再重建 Merkle 路径。上传内容只有证明与 4 个公开信号：`root, threshold, eventId, nullifier`，其中 `nullifier = Poseidon(secret, eventId)`。本人位置、`secret`、成绩、路径不发送给服务端。
+- 已撤销者的承诺在名单中找不到，浏览器明确提示“已撤销或不在当前名单中”并禁止出证；未撤销者不需要重新领证，刷新名单即可生成新根下的真实证明。
+- 电路（`circuits/qualification.circom`）强制约束：成绩/门槛为 0–100 的非负整数（含 7 位二进制约束，拒绝字段负数包装值）、路径位为二进制、Merkle 成员关系成立、`score >= threshold`、secret 非零，且 nullifier 绑定 secret 与活动。前端判断无法替代或绕过约束。
+- 服务端按当前名单与受信政策复核：公开信号中的根必须等于提交瞬间的当前根，门槛必须等于该活动配置门槛，eventId 必须匹配；撤销与核销由同一串行队列定序，验证开始后名单改变则最终核销拒绝过期根。
 - 核销以 `(eventId, nullifier)` 为原子唯一键：同活动并发重复提交仅一次成功；证明失败不写入、不消耗资格；记录持久化到 `data/redemptions.json`，重启保留；不同活动相互独立。
+- nullifier 在比较和持久化前规范化为无前导零十进制字符串，避免 `000...` 与规范值被当作两次核销；名单更新不会清空或绕过历史核销。
 
 ## 两个演示活动
 
@@ -48,11 +50,18 @@ npm run dev:server
 npm run dev
 ```
 
-打开 Vite 输出的地址：导入 `credentials/credential-00.json`，选择活动，点击“本地生成 Groth16 证明”，再提交核验；然后尝试 `credential-06.json` 或切换活动观察拒绝/独立核销行为。重新导入或切换活动后旧证明立即失效。
+打开 Vite 输出的地址：
+- 机构撤销台输入一个或多个叶子索引（如 `1 3`），页面会携带当前显示的 `expectedVersion`；版本冲突、重复撤销、越界或空请求会整批拒绝。
+- 持证人导入 `credentials/credential-00.json`，点击“下载/刷新完整 16 叶名单”，选择活动后本地重建路径并生成证明，再提交核验。
+- 撤销后，旧证明立即因旧根失效；未撤销凭证刷新名单后可继续证明，已撤销凭证会被明确禁止出证。
+- 更换凭证、活动或更新名单后旧证明立即废弃；异步证明晚到时不会恢复旧证明。
 
 ## curl 演示真实证明
 
 ```bash
+# 查看初始公开名单（版本 0，16 个叶承诺；只含公开承诺，不含 secret/成绩）
+curl -s http://127.0.0.1:3001/api/roster | jq '.version, .root, (.leaves|length)'
+
 # 达标证明（credential 0, 成绩 95, 活动 1001 门槛 60）
 npx tsx scripts/demoProof.ts 0 1001 /tmp/proof-ok.json
 curl -s -X POST http://127.0.0.1:3001/api/redeem \
@@ -63,6 +72,18 @@ curl -s -X POST http://127.0.0.1:3001/api/redeem \
 
 # 同一凭证参加另一活动（nullifier 不同，独立核销）
 npx tsx scripts/demoProof.ts 0 1002 /tmp/proof-b.json
+curl -s -X POST http://127.0.0.1:3001/api/redeem \
+  -H 'Content-Type: application/json' --data @/tmp/proof-b.json | jq
+
+# 撤销 credential 1（成绩 88，活动 1002 原本达标）。expectedVersion 必须为当前版本。
+curl -s http://127.0.0.1:3001/api/roster | jq '{expectedVersion: .version, indices: [1]}' > /tmp/revoke.json
+curl -s -X POST http://127.0.0.1:3001/api/revoke \
+  -H 'Content-Type: application/json' --data @/tmp/revoke.json | jq
+
+# 撤销后重新生成：credential 1 会在本地发现承诺已不在名单中，禁止出证。
+npx tsx scripts/demoProof.ts 1 1002 /tmp/revoked-proof.json
+
+# 未撤销的 credential 0 刷新当前名单后仍可证明；旧的 /tmp/proof-b.json 根已过期，提交得到 merkle root mismatch。
 curl -s -X POST http://127.0.0.1:3001/api/redeem \
   -H 'Content-Type: application/json' --data @/tmp/proof-b.json | jq
 ```
@@ -78,7 +99,8 @@ curl -s -X POST http://127.0.0.1:3001/api/redeem \
 - `circuits/qualification.circom` — 成绩门槛 + Merkle 成员 + nullifier 电路
 - `scripts/buildZk.ts` — 编译、Groth16 setup、导出验证密钥、发布浏览器产物
 - `scripts/generateCredentials.ts` — 16 份凭证 + 受信政策
+- `scripts/generateCredentials.ts` — 16 份凭证 + 公开名单 + 活动政策
 - `scripts/demoProof.ts` — 命令行生成真实证明
-- `server/` — Express 核验与持久化原子核销
-- `src/` — React 页面与浏览器内证明生成
+- `server/` — Express 当前名单、原子撤销、核验与持久化核销
+- `src/` — React 撤销台、名单刷新与浏览器内见证重建/证明生成
 - `test/` — Vitest 电路/核销/服务端测试

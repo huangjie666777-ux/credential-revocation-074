@@ -6,7 +6,7 @@ import type { EventPolicy } from "../shared/types.js";
 const here = dirname(fileURLToPath(import.meta.url));
 
 export interface PolicyConfig {
-  merkleRoot: string;
+  merkleRoot?: string;
   treeDepth: number;
   events: EventPolicy[];
 }

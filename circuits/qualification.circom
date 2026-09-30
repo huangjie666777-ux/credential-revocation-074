@@ -3,10 +3,13 @@ pragma circom 2.1.6;
 include "poseidon.circom";
 include "comparators.circom";
 include "mux1.circom";
+include "bitify.circom";
 
 // Range check: 0 <= in <= 100
 template RangeCheck100() {
     input signal in;
+    component bits = Num2Bits(7);
+    bits.in <== in;
     component lt = LessEqThan(8);
     lt.in[0] <== in;
     lt.in[1] <== 100;
